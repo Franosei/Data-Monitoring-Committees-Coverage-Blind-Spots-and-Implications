@@ -1,5 +1,4 @@
 # Data Monitoring Committees: Coverage, Blind Spots, and Implications
-# DMC Coverage Map: Independent Oversight in Clinical Trials
 
 ## Overview
 This project investigates the use of **Data Monitoring Committees (DMCs)** in clinical trials registered on [ClinicalTrials.gov](https://clinicaltrials.gov) between **2010 and 2025**.  
