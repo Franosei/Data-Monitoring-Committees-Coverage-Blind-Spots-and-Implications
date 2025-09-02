@@ -1,0 +1,3 @@
+has_dmc_label,n_with_text,safety_hits,futility_hits,safety_rate_pct,futility_rate_pct
+With DMC,74881,914,456,1.22,0.61
+No DMC,187244,1093,302,0.58,0.16
