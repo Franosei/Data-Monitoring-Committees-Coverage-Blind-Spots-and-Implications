@@ -36,7 +36,8 @@ class CTGV2DMCDownloader:
     Parameters
     ----------
     storage_seen_path : Optional[str]
-        Path to a newline-delimited file of NCT IDs to avoid re-downloading across runs.
+        Optional path to a newline-delimited file of NCT IDs to avoid re-downloading across runs.
+        Leave as None when rebuilding the full structured dataset.
     page_size : int
         Page size for the v2 API (`max` is 1000). Defaults to 1000.
     request_timeout : int
@@ -52,18 +53,47 @@ class CTGV2DMCDownloader:
 
     BASE_URL = "https://clinicaltrials.gov/api/v2/studies"
 
-    # Fields needed for this analysis
+    # Fields needed for DMC/outcome analysis. Field paths follow the
+    # ClinicalTrials.gov v2 study structure under protocolSection.
     FIELDS: Tuple[str, ...] = (
+        # Identification
         "protocolSection.identificationModule.nctId",
-        "protocolSection.oversightModule.oversightHasDmc",
-        "protocolSection.designModule.studyType",
-        "protocolSection.designModule.phases",
-        "protocolSection.sponsorCollaboratorsModule.leadSponsor.class",
+        "protocolSection.identificationModule.briefTitle",
+        "protocolSection.identificationModule.officialTitle",
+        # Status/outcomes
         "protocolSection.statusModule.overallStatus",
         "protocolSection.statusModule.whyStopped",
         "protocolSection.statusModule.startDateStruct.date",
         "protocolSection.statusModule.primaryCompletionDateStruct.date",
+        "protocolSection.statusModule.completionDateStruct.date",
+        # DMC presence
+        "protocolSection.oversightModule.oversightHasDmc",
+        # Design/risk features
+        "protocolSection.designModule.studyType",
+        "protocolSection.designModule.phases",
+        "protocolSection.designModule.designInfo.allocation",
+        "protocolSection.designModule.designInfo.interventionModel",
+        "protocolSection.designModule.designInfo.maskingInfo.masking",
+        "protocolSection.designModule.designInfo.primaryPurpose",
+        "protocolSection.designModule.enrollmentInfo.count",
+        # Sponsor
+        "protocolSection.sponsorCollaboratorsModule.leadSponsor.name",
+        "protocolSection.sponsorCollaboratorsModule.leadSponsor.class",
+        # Population
+        "protocolSection.eligibilityModule.minimumAge",
+        "protocolSection.eligibilityModule.maximumAge",
+        "protocolSection.eligibilityModule.sex",
+        # Disease/keywords
         "protocolSection.conditionsModule.conditions",
+        "protocolSection.conditionsModule.keywords",
+        # Interventions
+        "protocolSection.armsInterventionsModule.interventions.type",
+        "protocolSection.armsInterventionsModule.interventions.name",
+        # Outcomes
+        "protocolSection.outcomesModule.primaryOutcomes.measure",
+        "protocolSection.outcomesModule.primaryOutcomes.timeFrame",
+        "protocolSection.outcomesModule.secondaryOutcomes.measure",
+        "protocolSection.outcomesModule.secondaryOutcomes.timeFrame",
     )
 
     # Default statuses for “completed/terminated/withdrawn/suspended only”
@@ -71,7 +101,7 @@ class CTGV2DMCDownloader:
 
     def __init__(
         self,
-        storage_seen_path: Optional[str] = "seen_ids.txt",
+        storage_seen_path: Optional[str] = None,
         page_size: int = 1000,
         request_timeout: int = 60,
         backoff_seconds: float = 1.0,
@@ -119,9 +149,13 @@ class CTGV2DMCDownloader:
         -------
         pandas.DataFrame
             One row per unique NCT ID with these columns:
-            nct_id, has_dmc, phase, study_type, sponsor_class, overall_status,
-            why_stopped, start_date, start_year, primary_completion_date,
-            conditions (list[str]), therapeutic_area
+            nct_id, brief_title, official_title, has_dmc, phase, study_type,
+            allocation, intervention_model, masking, primary_purpose,
+            enrollment, minimum_age, maximum_age, sex, lead_sponsor_name,
+            lead_sponsor_class, sponsor_class, overall_status, why_stopped, start_date, start_year,
+            completion_date, primary_completion_date, conditions, keywords,
+            intervention_types, intervention_names, primary_outcomes,
+            secondary_outcomes, therapeutic_area
         """
         statuses_upper = tuple(s.upper() for s in statuses)
         logger.info("Starting fetch %s → %s; statuses=%s",
@@ -311,31 +345,72 @@ class CTGV2DMCDownloader:
         if not nct_id:
             return None
 
+        brief_title = self._get(g, "identificationModule.briefTitle")
+        official_title = self._get(g, "identificationModule.officialTitle")
         has_dmc = self._get(g, "oversightModule.oversightHasDmc")
         study_type = self._get(g, "designModule.studyType")
         phase = self._phase_join(self._get(g, "designModule.phases"))
+        allocation = self._get(g, "designModule.designInfo.allocation")
+        intervention_model = self._get(g, "designModule.designInfo.interventionModel")
+        masking = self._get(g, "designModule.designInfo.maskingInfo.masking")
+        primary_purpose = self._get(g, "designModule.designInfo.primaryPurpose")
+        enrollment = self._get(g, "designModule.enrollmentInfo.count")
+        minimum_age = self._get(g, "eligibilityModule.minimumAge")
+        maximum_age = self._get(g, "eligibilityModule.maximumAge")
+        sex = self._get(g, "eligibilityModule.sex")
+        lead_sponsor_name = self._get(g, "sponsorCollaboratorsModule.leadSponsor.name")
         sponsor_class = self._get(g, "sponsorCollaboratorsModule.leadSponsor.class")
         overall_status = self._get(g, "statusModule.overallStatus")
         why_stopped = self._get(g, "statusModule.whyStopped")
         start_date = self._get(g, "statusModule.startDateStruct.date")
         primary_completion = self._get(g, "statusModule.primaryCompletionDateStruct.date")
+        completion = self._get(g, "statusModule.completionDateStruct.date")
 
-        conditions = self._get(g, "conditionsModule.conditions") or []
-        if not isinstance(conditions, list):
-            conditions = [conditions] if conditions else []
+        conditions = self._as_list(self._get(g, "conditionsModule.conditions"))
+        keywords = self._as_list(self._get(g, "conditionsModule.keywords"))
+        interventions = self._as_list(self._get(g, "armsInterventionsModule.interventions"))
+        primary_outcome_items = self._as_list(self._get(g, "outcomesModule.primaryOutcomes"))
+        secondary_outcome_items = self._as_list(self._get(g, "outcomesModule.secondaryOutcomes"))
+
+        intervention_types = self._unique_dict_values(interventions, "type")
+        intervention_names = self._unique_dict_values(interventions, "name")
+        primary_outcomes = self._unique_dict_values(primary_outcome_items, "measure")
+        primary_outcome_time_frames = self._unique_dict_values(primary_outcome_items, "timeFrame")
+        secondary_outcomes = self._unique_dict_values(secondary_outcome_items, "measure")
+        secondary_outcome_time_frames = self._unique_dict_values(secondary_outcome_items, "timeFrame")
         therapeutic_area = self._classify_therapeutic_area(conditions)
 
         return {
             "nct_id": nct_id,
+            "brief_title": brief_title,
+            "official_title": official_title,
             "has_dmc": has_dmc,
             "phase": phase,
             "study_type": study_type,
+            "allocation": allocation,
+            "intervention_model": intervention_model,
+            "masking": masking,
+            "primary_purpose": primary_purpose,
+            "enrollment": enrollment,
+            "minimum_age": minimum_age,
+            "maximum_age": maximum_age,
+            "sex": sex,
+            "lead_sponsor_name": lead_sponsor_name,
+            "lead_sponsor_class": sponsor_class,
             "sponsor_class": sponsor_class,
             "overall_status": overall_status,
             "why_stopped": why_stopped,
             "start_date": start_date,
+            "completion_date": completion,
             "primary_completion_date": primary_completion,
             "conditions": conditions,
+            "keywords": keywords,
+            "intervention_types": intervention_types,
+            "intervention_names": intervention_names,
+            "primary_outcomes": primary_outcomes,
+            "primary_outcome_time_frames": primary_outcome_time_frames,
+            "secondary_outcomes": secondary_outcomes,
+            "secondary_outcome_time_frames": secondary_outcome_time_frames,
             "therapeutic_area": therapeutic_area,
         }
 
@@ -349,6 +424,33 @@ class CTGV2DMCDownloader:
             else:
                 return None
         return cur
+
+    @staticmethod
+    def _as_list(value) -> List:
+        """Normalize scalar/list/None API values to a list."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    @staticmethod
+    def _unique_dict_values(items: Iterable, key: str) -> List[str]:
+        """Extract unique string values for a key from a list of API dicts."""
+        values: List[str] = []
+        seen: Set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get(key)
+            if value is None:
+                continue
+            value_text = str(value).strip()
+            if not value_text or value_text in seen:
+                continue
+            seen.add(value_text)
+            values.append(value_text)
+        return values
 
     @staticmethod
     def _phase_join(phases):
@@ -451,8 +553,9 @@ class CTGV2DMCDownloader:
 
 
 if __name__ == "__main__":
-    # Adjust the path if you want a different location for the dedupe cache.
-    dl = CTGV2DMCDownloader(storage_seen_path="seen_ids.txt")
+    # Use storage_seen_path only for resumable/incremental crawls. For a full
+    # structured rebuild, keep it disabled so existing NCT IDs are not skipped.
+    dl = CTGV2DMCDownloader(storage_seen_path=None)
 
     df = dl.fetch_dataframe(
         start_date_from="2010-01-01",
